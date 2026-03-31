@@ -1,82 +1,76 @@
-"""Chinese TUI companion window for cc-bilingual.
+"""Chinese TUI companion for Claude Code.
 
-Runs in the right tmux pane. Accepts Chinese input, translates to English,
-and injects into the CC pane. Watches a JSONL log file for new entries and
-translates them from English to Chinese for display.
+Watches CC's own conversation JSONL file for new messages.
+No hooks, no settings modification needed.
 """
 
+import glob
 import json
 import os
-import readline  # enables proper line editing (backspace, arrow keys) for input()
+import readline  # proper line editing for CJK input
 import subprocess
 import sys
 import threading
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cc_translate import translate, translate_mixed, is_short_command
 
 # ---------------------------------------------------------------------------
-# Config
+# Config from env
 # ---------------------------------------------------------------------------
-
-LOG_PATH = os.environ.get("CC_BILINGUAL_LOG", "/tmp/cc-bilingual.jsonl")
+CONV_DIR = os.environ.get("CC_CONV_DIR", "")
+START_TIME = float(os.environ.get("CC_START_TIME", "0"))
 TMUX_TARGET = os.environ.get("CC_TMUX_TARGET", "cc-bilingual:0.0")
 
-# ---------------------------------------------------------------------------
-# Color constants
-# ---------------------------------------------------------------------------
-
+# Colors
 CYAN = "\033[36m"
 YELLOW = "\033[33m"
 DIM = "\033[2m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
-CLEAR_LINE = "\033[2K\r"
 
-# ---------------------------------------------------------------------------
-# Dedup state
-# ---------------------------------------------------------------------------
-
-_recent_sends: list = []
-_DEDUP_MAX = 20
-_DEDUP_TTL = 5  # seconds
+# Dedup
+_recent_sends = []
+_first_message = True
 
 
-def record_sent(text: str) -> None:
-    """Record a translated message that was sent to CC."""
+def record_sent(text):
     _recent_sends.append((time.time(), text.strip()))
-    if len(_recent_sends) > _DEDUP_MAX:
-        del _recent_sends[:-_DEDUP_MAX]
+    if len(_recent_sends) > 20:
+        del _recent_sends[:-20]
 
 
-def should_skip_user_message(text: str) -> bool:
-    """Return True if this user message is an echo of something we just sent."""
-    stripped = text.strip()
+def should_skip_user(text):
     now = time.time()
     for ts, sent in _recent_sends:
-        if now - ts <= _DEDUP_TTL and sent == stripped:
+        if now - ts < 10 and sent == text.strip():
             return True
     return False
 
 
 # ---------------------------------------------------------------------------
-# Log watcher
+# Find the CC session JSONL
 # ---------------------------------------------------------------------------
+def find_session_file(conv_dir, after_time):
+    """Wait for a new JSONL file created after after_time."""
+    print(f"{DIM}Waiting for CC session...{RESET}", flush=True)
+    while True:
+        files = glob.glob(os.path.join(conv_dir, "*.jsonl"))
+        for f in sorted(files, key=os.path.getmtime, reverse=True):
+            if os.path.getmtime(f) > after_time:
+                print(f"{DIM}Session found!{RESET}\n", flush=True)
+                return f
+        time.sleep(0.5)
 
-def watch_logfile(logpath: str, callback) -> None:
-    """Watch *logpath* for new JSONL lines and call callback(data) for each.
 
-    Seeks to the end of the file on open so only NEW lines are processed.
-    Polls for file existence and new content every 0.3 s.
-    Designed to run as a daemon thread.
-    """
-    # Wait for file to exist
-    while not os.path.exists(logpath):
-        time.sleep(0.3)
-
-    with open(logpath, "r", encoding="utf-8") as fh:
-        # Seek to end — ignore pre-existing lines
-        fh.seek(0, 2)
+# ---------------------------------------------------------------------------
+# Watch CC conversation JSONL
+# ---------------------------------------------------------------------------
+def watch_conversation(filepath, callback):
+    """Tail-watch CC's conversation JSONL for new messages."""
+    with open(filepath, "r", encoding="utf-8") as fh:
+        fh.seek(0, 2)  # start at end
         while True:
             line = fh.readline()
             if not line:
@@ -86,105 +80,110 @@ def watch_logfile(logpath: str, callback) -> None:
             if not line:
                 continue
             try:
-                data = json.loads(line)
-                callback(data)
+                entry = json.loads(line)
+                callback(entry)
             except json.JSONDecodeError:
                 pass
 
 
-# ---------------------------------------------------------------------------
-# Send to CC pane
-# ---------------------------------------------------------------------------
+def on_entry(entry):
+    """Handle a new JSONL entry from CC's conversation log."""
+    entry_type = entry.get("type", "")
 
-def send_to_cc(text: str) -> None:
-    """Send *text* as literal keystrokes followed by Enter to the CC tmux pane."""
-    subprocess.run(
-        ["tmux", "send-keys", "-t", TMUX_TARGET, "-l", text],
-        capture_output=True,
-    )
-    subprocess.run(
-        ["tmux", "send-keys", "-t", TMUX_TARGET, "Enter"],
-        capture_output=True,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Message display
-# ---------------------------------------------------------------------------
-
-def on_message(data: dict) -> None:
-    """Handle a log entry from the CC hook."""
-    role = data.get("role", "")
-    text = data.get("text", "")
-    if not text:
-        return
-
-    if role == "user":
-        if should_skip_user_message(text):
+    if entry_type == "user":
+        msg = entry.get("message", {})
+        content = msg.get("content", "")
+        # Extract text
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = " ".join(c.get("text", "") for c in content if c.get("type") == "text")
+        else:
             return
+        if not text or should_skip_user(text):
+            return
+        # User typed directly in CC pane
         translated = translate(text, "en", "zh-CN")
-        print(
-            f"\n{YELLOW}你 (CC):{RESET} {translated}\n"
-            f"  {DIM}EN: {text}{RESET}",
-            flush=True,
-        )
+        print(f"\n{YELLOW}You (CC):{RESET} {text}", flush=True)
+        print(f"{DIM}中文: {translated}{RESET}", flush=True)
 
-    elif role == "assistant":
-        translated = translate_mixed(text, "en", "zh-CN")
-        print(
-            f"\n{CYAN}CC:{RESET} {translated}\n"
-            f"{DIM}{'─' * 50}{RESET}",
-            flush=True,
-        )
+    elif entry_type == "assistant":
+        msg = entry.get("message", {})
+        content = msg.get("content", [])
+        if not isinstance(content, list):
+            return
+        # Collect all text blocks
+        texts = [c["text"] for c in content if c.get("type") == "text" and c.get("text", "").strip()]
+        if not texts:
+            return
+        full_text = "\n".join(texts)
+        translated = translate_mixed(full_text, "en", "zh-CN")
+        print(f"\n{CYAN}CC:{RESET} {translated}", flush=True)
+        print(f"{DIM}{'─' * 50}{RESET}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Send to CC
+# ---------------------------------------------------------------------------
+def send_to_cc(text):
+    subprocess.run(["tmux", "send-keys", "-t", TMUX_TARGET, "-l", text], capture_output=True)
+    subprocess.run(["tmux", "send-keys", "-t", TMUX_TARGET, "Enter"], capture_output=True)
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def main():
+    global _first_message
 
-def main() -> None:
-    print(
-        f"\n{BOLD}{CYAN}cc-bilingual TUI{RESET}\n"
-        f"{DIM}中文输入 → 英文 → CC pane | CC 输出 → 中文显示{RESET}\n"
-        f"{DIM}输入 /quit 退出{RESET}\n",
-        flush=True,
-    )
+    print(f"\n{BOLD}{CYAN}cc-bilingual{RESET}")
+    print(f"{DIM}中文输入 → 英文发给 CC | CC 英文回复 → 中文翻译{RESET}")
+    print(f"{DIM}/quit 退出 | Ctrl-B + 方向键 或鼠标点击切换 pane{RESET}\n", flush=True)
 
-    watcher_thread = threading.Thread(
-        target=watch_logfile,
-        args=(LOG_PATH, on_message),
-        daemon=True,
-    )
-    watcher_thread.start()
+    if not CONV_DIR:
+        print(f"{YELLOW}Error: CC_CONV_DIR not set{RESET}")
+        return
+
+    # Find the session file
+    session_file = find_session_file(CONV_DIR, START_TIME)
+
+    # Start watcher
+    watcher = threading.Thread(target=watch_conversation, args=(session_file, on_entry), daemon=True)
+    watcher.start()
 
     while True:
         try:
-            # \001 \002 wrap non-printable chars so readline calculates cursor correctly
             prompt = f"\001{YELLOW}\002输入> \001{RESET}\002"
             text = input(prompt)
         except (EOFError, KeyboardInterrupt):
             print(f"\n{DIM}再见{RESET}")
             break
 
-        if not text.strip():
-            # Send an empty Enter to CC (e.g. to confirm a prompt)
+        stripped = text.strip()
+        if not stripped:
             send_to_cc("")
             continue
-
-        if text.strip() == "/quit":
-            print(f"{DIM}退出{RESET}")
+        if stripped == "/quit":
             break
 
-        if is_short_command(text):
-            print(f"{DIM}(透传) {text}{RESET}", flush=True)
-            send_to_cc(text)
+        if is_short_command(stripped):
+            print(f"{DIM}(透传) {stripped}{RESET}", flush=True)
+            send_to_cc(stripped)
             continue
 
-        # Translate Chinese → English, then send
-        translated = translate(text, "zh-CN", "en")
+        # Translate zh → en
+        translated = translate(stripped, "zh-CN", "en")
+
+        # First message: ask CC to respond in English
+        if _first_message:
+            to_send = translated + "\n\n(Please always respond in English.)"
+            _first_message = False
+        else:
+            to_send = translated
+
         print(f"{DIM}EN: {translated}{RESET}", flush=True)
-        record_sent(translated)
-        send_to_cc(translated)
+        record_sent(to_send)
+        send_to_cc(to_send)
 
 
 if __name__ == "__main__":
