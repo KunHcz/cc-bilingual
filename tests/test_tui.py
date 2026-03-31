@@ -14,22 +14,23 @@ class TestFindSessionFile(unittest.TestCase):
     def test_finds_new_file(self):
         from cc_tui import find_session_file
         with tempfile.TemporaryDirectory() as tmpdir:
-            before = time.time() - 1
-            path = os.path.join(tmpdir, "test-session.jsonl")
-            with open(path, "w") as f:
+            old = os.path.join(tmpdir, "old.jsonl")
+            with open(old, "w") as f:
                 f.write("{}\n")
-            result = find_session_file(tmpdir, before)
-            self.assertEqual(result, path)
+            new = os.path.join(tmpdir, "new.jsonl")
+            with open(new, "w") as f:
+                f.write("{}\n")
+            # old is "existing", new is not
+            result = find_session_file(tmpdir, existing_files={old})
+            self.assertEqual(result, new)
 
-    def test_ignores_old_files(self):
+    def test_waits_for_new_file(self):
         from cc_tui import find_session_file
         with tempfile.TemporaryDirectory() as tmpdir:
-            old_path = os.path.join(tmpdir, "old.jsonl")
-            with open(old_path, "w") as f:
+            old = os.path.join(tmpdir, "old.jsonl")
+            with open(old, "w") as f:
                 f.write("{}\n")
-            os.utime(old_path, (0, 0))
 
-            after = time.time()
             def create_later():
                 time.sleep(0.6)
                 with open(os.path.join(tmpdir, "new.jsonl"), "w") as f:
@@ -37,7 +38,7 @@ class TestFindSessionFile(unittest.TestCase):
 
             t = threading.Thread(target=create_later, daemon=True)
             t.start()
-            result = find_session_file(tmpdir, after)
+            result = find_session_file(tmpdir, existing_files={old})
             self.assertTrue(result.endswith("new.jsonl"))
 
 

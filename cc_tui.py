@@ -20,7 +20,7 @@ from cc_translate import translate, translate_mixed, is_short_command
 # Config from env
 # ---------------------------------------------------------------------------
 CONV_DIR = os.environ.get("CC_CONV_DIR", "")
-START_TIME = float(os.environ.get("CC_START_TIME", "0"))
+EXISTING_FILES_PATH = os.environ.get("CC_EXISTING_FILES", "/tmp/cc-bilingual-existing.txt")
 TMUX_TARGET = os.environ.get("CC_TMUX_TARGET", "cc-bilingual:0.0")
 
 # Colors
@@ -52,14 +52,26 @@ def should_skip_user(text):
 # ---------------------------------------------------------------------------
 # Find the CC session JSONL
 # ---------------------------------------------------------------------------
-def find_session_file(conv_dir, after_time):
-    """Wait for a new JSONL file created after after_time."""
+def _load_existing_files():
+    """Load the list of pre-existing JSONL files (recorded before CC started)."""
+    existing = set()
+    if os.path.exists(EXISTING_FILES_PATH):
+        with open(EXISTING_FILES_PATH) as f:
+            existing = {line.strip() for line in f if line.strip()}
+    return existing
+
+
+def find_session_file(conv_dir, existing_files=None):
+    """Wait for a JSONL file that didn't exist before CC started."""
+    if existing_files is None:
+        existing_files = _load_existing_files()
     print(f"{DIM}Waiting for CC session...{RESET}", flush=True)
     while True:
         files = glob.glob(os.path.join(conv_dir, "*.jsonl"))
         for f in sorted(files, key=os.path.getmtime, reverse=True):
-            if os.path.getmtime(f) > after_time:
-                print(f"{DIM}Session found!{RESET}\n", flush=True)
+            if f not in existing_files:
+                basename = os.path.basename(f)
+                print(f"{DIM}Session: {basename[:12]}...{RESET}\n", flush=True)
                 return f
         time.sleep(0.5)
 
@@ -144,8 +156,8 @@ def main():
         print(f"{YELLOW}Error: CC_CONV_DIR not set{RESET}")
         return
 
-    # Find the session file
-    session_file = find_session_file(CONV_DIR, START_TIME)
+    # Find the session file (one that didn't exist before)
+    session_file = find_session_file(CONV_DIR)
 
     # Start watcher
     watcher = threading.Thread(target=watch_conversation, args=(session_file, on_entry), daemon=True)

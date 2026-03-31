@@ -23,8 +23,9 @@ for cmd in tmux python3 claude; do
     fi
 done
 
-# Record start time (TUI uses this to find the new session file)
-START_TIME=$(python3 -c "import time; print(time.time())")
+# Record existing JSONL files so TUI can identify the NEW one
+EXISTING_FILES="/tmp/cc-bilingual-existing.txt"
+ls "$CONV_DIR"/*.jsonl 2>/dev/null | sort > "$EXISTING_FILES" || true
 
 # --- Kill existing session ---
 tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
@@ -36,7 +37,7 @@ tmux split-window -h -t "$SESSION_NAME"
 
 # Right pane (1): Chinese TUI
 tmux send-keys -t "$SESSION_NAME:0.1" \
-    "CC_CONV_DIR='$CONV_DIR' CC_START_TIME='$START_TIME' CC_TMUX_TARGET='$SESSION_NAME:0.0' python3 '$TUI_SCRIPT'" Enter
+    "CC_CONV_DIR='$CONV_DIR' CC_EXISTING_FILES='$EXISTING_FILES' CC_TMUX_TARGET='$SESSION_NAME:0.0' python3 '$TUI_SCRIPT'" Enter
 
 # Left pane (0): Claude Code
 tmux send-keys -t "$SESSION_NAME:0.0" "cd '$WORK_DIR' && claude" Enter
