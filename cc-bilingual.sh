@@ -7,8 +7,15 @@ SESSION_NAME="cc-bilingual"
 LOGFILE="/tmp/cc-bilingual.jsonl"
 HOOK_SCRIPT="$SCRIPT_DIR/cc_hook.sh"
 TUI_SCRIPT="$SCRIPT_DIR/cc_tui.py"
-WORK_DIR="${1:-.}"  # 第一个参数为工作目录，默认当前目录
+WORK_DIR="${1:-.}"
 WORK_DIR="$(cd "$WORK_DIR" && pwd)"
+
+GLOBAL_SETTINGS="$HOME/.claude/settings.json"
+GLOBAL_BACKUP="$HOME/.claude/settings.json.ccbilingual.bak"
+PROJECT_SETTINGS_DIR="$WORK_DIR/.claude"
+PROJECT_SETTINGS="$PROJECT_SETTINGS_DIR/settings.json"
+CREATED_DIR=false
+CREATED_FILE=false
 
 # --- Dependency check ---
 for cmd in tmux python3 claude; do
@@ -21,13 +28,13 @@ for cmd in tmux python3 claude; do
 done
 
 # --- Cleanup on exit ---
-PROJECT_SETTINGS_DIR="$WORK_DIR/.claude"
-PROJECT_SETTINGS="$PROJECT_SETTINGS_DIR/settings.json"
-CREATED_DIR=false
-CREATED_FILE=false
-
 cleanup() {
-    # 清理项目级 settings
+    # 恢复全局 language
+    if [ -f "$GLOBAL_BACKUP" ]; then
+        cp "$GLOBAL_BACKUP" "$GLOBAL_SETTINGS"
+        rm -f "$GLOBAL_BACKUP"
+    fi
+    # 清理项目级 hooks
     if $CREATED_FILE; then
         rm -f "$PROJECT_SETTINGS"
     elif [ -f "$PROJECT_SETTINGS.ccbilingual.bak" ]; then
@@ -44,12 +51,21 @@ trap cleanup EXIT INT TERM
 # --- Reset log ---
 : > "$LOGFILE"
 
-# --- Inject hooks into project-level settings (不碰全局配置) ---
+# --- 1) 全局：只改 language 为 en（退出时恢复） ---
+cp "$GLOBAL_SETTINGS" "$GLOBAL_BACKUP"
+python3 -c "
+import json, sys
+with open(sys.argv[1]) as f: cfg = json.load(f)
+cfg['language'] = 'en'
+with open(sys.argv[1], 'w') as f: json.dump(cfg, f, indent=2)
+" "$GLOBAL_SETTINGS"
+echo "✓ Global language → en (will restore on exit)"
+
+# --- 2) 项目级：注入 hooks（不碰全局） ---
 if [ ! -d "$PROJECT_SETTINGS_DIR" ]; then
     mkdir -p "$PROJECT_SETTINGS_DIR"
     CREATED_DIR=true
 fi
-
 if [ ! -f "$PROJECT_SETTINGS" ]; then
     echo '{}' > "$PROJECT_SETTINGS"
     CREATED_FILE=true
@@ -59,51 +75,34 @@ fi
 
 python3 -c "
 import json, sys
-
-path = sys.argv[1]
-hook_cmd = sys.argv[2]
-
-with open(path) as f:
-    cfg = json.load(f)
-
-cfg['language'] = 'en'
+path, hook_cmd = sys.argv[1], sys.argv[2]
+with open(path) as f: cfg = json.load(f)
 cfg.setdefault('hooks', {})
-cfg['hooks']['UserPromptSubmit'] = [{
-    'hooks': [{
-        'type': 'command',
-        'command': f'cat | {hook_cmd} user',
-        'timeout': 5
-    }]
-}]
-cfg['hooks']['Stop'] = [{
-    'hooks': [{
-        'type': 'command',
-        'command': f'cat | {hook_cmd} assistant',
-        'timeout': 30
-    }]
-}]
-
-with open(path, 'w') as f:
-    json.dump(cfg, f, indent=2)
+cfg['hooks']['UserPromptSubmit'] = [{'hooks': [{'type': 'command', 'command': f'cat | {hook_cmd} user', 'timeout': 5}]}]
+cfg['hooks']['Stop'] = [{'hooks': [{'type': 'command', 'command': f'cat | {hook_cmd} assistant', 'timeout': 30}]}]
+with open(path, 'w') as f: json.dump(cfg, f, indent=2)
 " "$PROJECT_SETTINGS" "$HOOK_SCRIPT"
+echo "✓ Hooks injected into project settings"
 
-echo "✓ Hooks injected into $PROJECT_SETTINGS (project-level, global untouched)"
-
-# --- Kill existing session if any ---
+# --- Kill existing session ---
 tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
 
 # --- Create tmux session ---
 tmux new-session -d -s "$SESSION_NAME"
+
+# 开启鼠标支持：可以点击切换 pane
+tmux set-option -t "$SESSION_NAME" mouse on
+
 tmux split-window -h -t "$SESSION_NAME"
 
 # Right pane (1): Chinese TUI
 tmux send-keys -t "$SESSION_NAME:0.1" \
     "CC_BILINGUAL_LOG='$LOGFILE' CC_TMUX_TARGET='$SESSION_NAME:0.0' python3 '$TUI_SCRIPT'" Enter
 
-# Left pane (0): Claude Code in work dir
+# Left pane (0): Claude Code
 tmux send-keys -t "$SESSION_NAME:0.0" "cd '$WORK_DIR' && claude" Enter
 
-# Focus right pane (user types Chinese here)
+# Focus right pane
 tmux select-pane -t "$SESSION_NAME:0.1"
 
 # Attach
