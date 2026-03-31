@@ -156,11 +156,12 @@ def main():
         print(f"{YELLOW}Error: CC_CONV_DIR not set{RESET}")
         return
 
-    # Find the session file (one that didn't exist before)
-    session_file = find_session_file(CONV_DIR)
+    # Background: find session file then watch it
+    def find_and_watch():
+        session_file = find_session_file(CONV_DIR)
+        watch_conversation(session_file, on_entry)
 
-    # Start watcher
-    watcher = threading.Thread(target=watch_conversation, args=(session_file, on_entry), daemon=True)
+    watcher = threading.Thread(target=find_and_watch, daemon=True)
     watcher.start()
 
     while True:
