@@ -66,6 +66,7 @@ hook_cmd = sys.argv[2]
 with open(path) as f:
     cfg = json.load(f)
 
+cfg['language'] = 'en'
 cfg.setdefault('hooks', {})
 cfg['hooks']['UserPromptSubmit'] = [{
     'hooks': [{

@@ -7,6 +7,7 @@ translates them from English to Chinese for display.
 
 import json
 import os
+import readline  # enables proper line editing (backspace, arrow keys) for input()
 import subprocess
 import sys
 import threading
@@ -158,7 +159,9 @@ def main() -> None:
 
     while True:
         try:
-            text = input(f"{YELLOW}输入> {RESET}")
+            # \001 \002 wrap non-printable chars so readline calculates cursor correctly
+            prompt = f"\001{YELLOW}\002输入> \001{RESET}\002"
+            text = input(prompt)
         except (EOFError, KeyboardInterrupt):
             print(f"\n{DIM}再见{RESET}")
             break
