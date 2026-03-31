@@ -7,7 +7,7 @@ No hooks, no settings modification needed.
 import glob
 import json
 import os
-import readline  # proper line editing for CJK input
+import readline  # enables proper line editing (backspace, arrows) for CJK
 import subprocess
 import sys
 import threading
@@ -17,22 +17,25 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cc_translate import translate, translate_mixed, is_short_command
 
 # ---------------------------------------------------------------------------
-# Config from env
+# Config
 # ---------------------------------------------------------------------------
 CONV_DIR = os.environ.get("CC_CONV_DIR", "")
 EXISTING_FILES_PATH = os.environ.get("CC_EXISTING_FILES", "/tmp/cc-bilingual-existing.txt")
 TMUX_TARGET = os.environ.get("CC_TMUX_TARGET", "cc-bilingual:0.0")
 
-# Colors
-CYAN = "\033[36m"
-YELLOW = "\033[33m"
-DIM = "\033[2m"
-BOLD = "\033[1m"
-RESET = "\033[0m"
+# ANSI
+C = "\033[36m"     # cyan
+Y = "\033[33m"     # yellow
+G = "\033[32m"     # green
+D = "\033[2m"      # dim
+B = "\033[1m"      # bold
+R = "\033[0m"      # reset
+LINE = f"{D}{'─' * 50}{R}"
 
-# Dedup
+# State
 _recent_sends = []
 _first_message = True
+_session_ready = False
 
 
 def record_sent(text):
@@ -50,10 +53,9 @@ def should_skip_user(text):
 
 
 # ---------------------------------------------------------------------------
-# Find the CC session JSONL
+# Session discovery
 # ---------------------------------------------------------------------------
 def _load_existing_files():
-    """Load the list of pre-existing JSONL files (recorded before CC started)."""
     existing = set()
     if os.path.exists(EXISTING_FILES_PATH):
         with open(EXISTING_FILES_PATH) as f:
@@ -65,24 +67,21 @@ def find_session_file(conv_dir, existing_files=None):
     """Wait for a JSONL file that didn't exist before CC started."""
     if existing_files is None:
         existing_files = _load_existing_files()
-    print(f"{DIM}Waiting for CC session...{RESET}", flush=True)
     while True:
         files = glob.glob(os.path.join(conv_dir, "*.jsonl"))
         for f in sorted(files, key=os.path.getmtime, reverse=True):
             if f not in existing_files:
-                basename = os.path.basename(f)
-                print(f"{DIM}Session: {basename[:12]}...{RESET}\n", flush=True)
                 return f
         time.sleep(0.5)
 
 
 # ---------------------------------------------------------------------------
-# Watch CC conversation JSONL
+# Conversation watcher
 # ---------------------------------------------------------------------------
 def watch_conversation(filepath, callback):
     """Tail-watch CC's conversation JSONL for new messages."""
     with open(filepath, "r", encoding="utf-8") as fh:
-        fh.seek(0, 2)  # start at end
+        fh.seek(0, 2)
         while True:
             line = fh.readline()
             if not line:
@@ -92,8 +91,7 @@ def watch_conversation(filepath, callback):
             if not line:
                 continue
             try:
-                entry = json.loads(line)
-                callback(entry)
+                callback(json.loads(line))
             except json.JSONDecodeError:
                 pass
 
@@ -105,7 +103,6 @@ def on_entry(entry):
     if entry_type == "user":
         msg = entry.get("message", {})
         content = msg.get("content", "")
-        # Extract text
         if isinstance(content, str):
             text = content
         elif isinstance(content, list):
@@ -114,28 +111,29 @@ def on_entry(entry):
             return
         if not text or should_skip_user(text):
             return
-        # User typed directly in CC pane
-        translated = translate(text, "en", "zh-CN")
-        print(f"\n{YELLOW}You (CC):{RESET} {text}", flush=True)
-        print(f"{DIM}中文: {translated}{RESET}", flush=True)
+        # User typed directly in CC pane — show both
+        zh = translate(text, "en", "zh-CN")
+        print(f"\n{Y}You:{R} {text}")
+        print(f"{D}     {zh}{R}", flush=True)
 
     elif entry_type == "assistant":
         msg = entry.get("message", {})
         content = msg.get("content", [])
         if not isinstance(content, list):
             return
-        # Collect all text blocks
         texts = [c["text"] for c in content if c.get("type") == "text" and c.get("text", "").strip()]
         if not texts:
             return
-        full_text = "\n".join(texts)
-        translated = translate_mixed(full_text, "en", "zh-CN")
-        print(f"\n{CYAN}CC:{RESET} {translated}", flush=True)
-        print(f"{DIM}{'─' * 50}{RESET}", flush=True)
+        en_text = "\n".join(texts)
+        zh_text = translate_mixed(en_text, "en", "zh-CN")
+        # Show both English and Chinese for learning
+        print(f"\n{C}{B}CC (EN):{R}\n{en_text}")
+        print(f"\n{G}{B}CC (中文):{R}\n{zh_text}")
+        print(LINE, flush=True)
 
 
 # ---------------------------------------------------------------------------
-# Send to CC
+# tmux interaction
 # ---------------------------------------------------------------------------
 def send_to_cc(text):
     subprocess.run(["tmux", "send-keys", "-t", TMUX_TARGET, "-l", text], capture_output=True)
@@ -146,30 +144,37 @@ def send_to_cc(text):
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    global _first_message
+    global _first_message, _session_ready
 
-    print(f"\n{BOLD}{CYAN}cc-bilingual{RESET}")
-    print(f"{DIM}中文输入 → 英文发给 CC | CC 英文回复 → 中文翻译{RESET}")
-    print(f"{DIM}/quit 退出 | Ctrl-B + 方向键 或鼠标点击切换 pane{RESET}\n", flush=True)
+    print(f"""
+{B}{C}cc-bilingual{R} — Claude Code bilingual companion
+{LINE}
+{D}  输入中文 → 自动翻译为英文发给 CC
+  CC 英文回复 → 同时显示英文原文 + 中文翻译
+  短指令 (y/n) 直接透传 | /quit 退出{R}
+{LINE}
+""", flush=True)
 
     if not CONV_DIR:
-        print(f"{YELLOW}Error: CC_CONV_DIR not set{RESET}")
+        print(f"{Y}Error: CC_CONV_DIR not set{R}")
         return
 
-    # Background: find session file then watch it
     def find_and_watch():
+        global _session_ready
         session_file = find_session_file(CONV_DIR)
+        sid = os.path.basename(session_file)[:8]
+        print(f"{D}  ✓ CC session connected ({sid}...){R}\n", flush=True)
+        _session_ready = True
         watch_conversation(session_file, on_entry)
 
-    watcher = threading.Thread(target=find_and_watch, daemon=True)
-    watcher.start()
+    threading.Thread(target=find_and_watch, daemon=True).start()
 
     while True:
         try:
-            prompt = f"\001{YELLOW}\002输入> \001{RESET}\002"
+            prompt = f"\001{Y}\002输入> \001{R}\002"
             text = input(prompt)
         except (EOFError, KeyboardInterrupt):
-            print(f"\n{DIM}再见{RESET}")
+            print(f"\n{D}bye{R}")
             break
 
         stripped = text.strip()
@@ -180,21 +185,20 @@ def main():
             break
 
         if is_short_command(stripped):
-            print(f"{DIM}(透传) {stripped}{RESET}", flush=True)
+            print(f"{D}  → (pass-through) {stripped}{R}", flush=True)
             send_to_cc(stripped)
             continue
 
         # Translate zh → en
         translated = translate(stripped, "zh-CN", "en")
 
-        # First message: ask CC to respond in English
         if _first_message:
             to_send = translated + "\n\n(Please always respond in English.)"
             _first_message = False
         else:
             to_send = translated
 
-        print(f"{DIM}EN: {translated}{RESET}", flush=True)
+        print(f"{D}  → {translated}{R}", flush=True)
         record_sent(to_send)
         send_to_cc(to_send)
 
